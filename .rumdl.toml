@@ -1,0 +1,16 @@
+[global]
+line-length = 120
+flavor = "gfm"
+cache = false
+exclude = ["CHANGELOG.md", ".changes/"]
+
+[per-file-ignores]
+"gendocs/*.md" = ["MD041", "MD057"]
+# The crate docs: rustdoc supplies the heading, and its warning block is a <div>.
+"chafernet/src/crate-docs.md" = ["MD033", "MD041"]
+
+[MD004]
+style = "asterisk"
+
+[MD013]
+reflow = true

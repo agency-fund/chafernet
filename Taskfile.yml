@@ -1,0 +1,176 @@
+# $schema: https://taskfile.dev/schema.json
+# The development commands, run with Task (https://taskfile.dev): `task --list` shows them. CI runs these same tasks.
+version: "3"
+
+vars:
+  # The Python that `setup` puts in .venv; `task setup PYTHON=3.15t` picks another.
+  PYTHON: '{{.PYTHON | default "3.14"}}'
+  # The Rust version Cargo.toml promises, which `msrv` builds with.
+  MSRV:
+    sh: sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml
+  # The Python in .venv, as uv names it (3.14, 3.15t, ...), or PYTHON if there is no .venv.
+  VENV_PYTHON:
+    sh: test -x .venv/bin/python && .venv/bin/python -c "import sys, sysconfig; print(f'{sys.version_info[0]}.{sys.version_info[1]}' + ('t' if sysconfig.get_config_var('Py_GIL_DISABLED') else ''))" || echo {{.PYTHON}}
+
+tasks:
+  default:
+    cmds:
+      - task --list
+    silent: true
+
+  setup:
+    desc: Create .venv with the development dependencies (PYTHON selects the interpreter)
+    cmds:
+      - uv sync --python {{.PYTHON}} --group dev --no-install-project
+
+  build:
+    desc: Build the extension module into .venv, in release mode
+    cmds:
+      - .venv/bin/maturin develop --release --uv
+
+  build:debug:
+    desc: Build the extension module into .venv with debug assertions
+    cmds:
+      - .venv/bin/maturin develop --uv
+
+  test:
+    desc: >-
+      Run the Rust tests, natively and on WebAssembly, rebuild the extension with debug assertions, and run the Python
+      tests; needs the wasm targets and wasmtime (arguments after -- go to pytest)
+    cmds:
+      - task: test:rust
+      - task: test:wasm
+      - task: build:debug
+      - task: test:python
+
+  test:rust:
+    desc: Run the Rust crate's tests; needs no Python
+    cmds:
+      - cargo test -p chafernet
+
+  test:wasm:
+    desc: >-
+      Build the Rust crate for WebAssembly in a browser (wasm32-unknown-unknown, with the wasm_js feature) and run its
+      tests on WASI (wasm32-wasip2) under wasmtime; needs those Rust targets and wasmtime
+    preconditions:
+      - sh: rustup target list --installed | grep -qx wasm32-unknown-unknown && rustup target list --installed | grep -qx wasm32-wasip2
+        msg: 'Add the targets: rustup target add wasm32-unknown-unknown wasm32-wasip2'
+      - sh: command -v wasmtime
+        msg: wasmtime is not installed (https://wasmtime.dev)
+    env:
+      CARGO_TARGET_WASM32_WASIP2_RUNNER: wasmtime
+    cmds:
+      - cargo build --locked -p chafernet --target wasm32-unknown-unknown --features wasm_js
+      - cargo test --locked -p chafernet --target wasm32-wasip2
+
+  test:python:
+    desc: >-
+      Run the Python tests on the build that is in .venv, without rebuilding it; `task test` rebuilds first
+      (HYPOTHESIS_PROFILE=ci or thorough searches harder; arguments after -- go to pytest)
+    preconditions:
+      - sh: .venv/bin/python -c "import chafernet._chafernet"
+        msg: 'The extension is not built into .venv: run `task build` or `task test`'
+    cmds:
+      - .venv/bin/python -m pytest {{.CLI_ARGS}}
+      - .venv/bin/python -m doctest python/README.md python/chafernet/__init__.py
+
+  coverage:
+    desc: Measure test coverage into coverage/ (Rust from the Rust and Python tests, Python from the Python tests); leaves an instrumented debug build in .venv, so run `task build` afterwards
+    env:
+      HYPOTHESIS_PROFILE: '{{.HYPOTHESIS_PROFILE | default "ci"}}'
+    cmds:
+      - |
+        set -e
+        eval "$(cargo llvm-cov show-env --sh)"
+        cargo llvm-cov clean --workspace
+        cargo test -p chafernet
+        .venv/bin/maturin develop --uv
+        rm -rf coverage && mkdir coverage
+        .venv/bin/python -m coverage run -m pytest -q
+        cargo llvm-cov report --lcov --output-path coverage/rust.lcov
+        cargo llvm-cov report --html --output-dir coverage/rust
+        cargo llvm-cov report --summary-only
+        .venv/bin/python -m coverage html -q -d coverage/python
+        .venv/bin/python -m coverage xml -q -o coverage/python.xml
+        .venv/bin/python -m coverage report
+
+  stubs:
+    desc: Regenerate python/chafernet/_chafernet.pyi from the extension's Rust source (pyo3's type stub generation)
+    cmds:
+      - task: stubs:generate
+      - cp .venv/stubs/chafernet/_chafernet.pyi python/chafernet/_chafernet.pyi
+
+  stubs:check:
+    desc: Check that python/chafernet/_chafernet.pyi matches what `task stubs` generates
+    cmds:
+      - task: stubs:generate
+      - diff -u python/chafernet/_chafernet.pyi .venv/stubs/chafernet/_chafernet.pyi
+
+  stubs:generate:
+    internal: true
+    cmds:
+      - rm -rf .venv/stubs
+      # With the oldest supported Python, so that the stub is valid for every version (see pyo3's type-stub guide).
+      - .venv/bin/maturin generate-stubs --quiet --out .venv/stubs --interpreter .venv/bin/python
+      # A header, and pyo3 writes the annotations given in `signature = (...)` as string literals; they are plain
+      # names. sed -i is avoided because GNU's and macOS's take different arguments.
+      - |
+        stub=.venv/stubs/chafernet/_chafernet.pyi
+        { echo '# Generated from the Rust source by `task stubs`; do not edit.'; sed -E 's/: "([A-Za-z_| ]+)"/: \1/g' "${stub}"; } > "${stub}.new"
+        mv "${stub}.new" "${stub}"
+
+  lint:
+    desc: Run every check CI's lint job runs; needs .venv, from `task setup`
+    cmds:
+      - task: lint:rust
+      - task: lint:prek
+      - task: lint:types
+      - task: stubs:check
+
+  lint:rust:
+    desc: cargo fmt and clippy, rustdoc with warnings denied, and a cargo publish dry run
+    env:
+      RUSTDOCFLAGS: -D warnings
+    cmds:
+      - cargo fmt --all --check
+      - cargo clippy --workspace --all-targets -- -D warnings
+      - cargo doc -p chafernet --no-deps
+      - cargo publish -p chafernet --dry-run --allow-dirty
+
+  lint:prek:
+    desc: Run the prek hooks in prek.toml (ruff, rumdl, file hygiene, uv.lock, zizmor, the READMEs) on every file
+    cmds:
+      - .venv/bin/prek run --all-files
+
+  lint:types:
+    desc: Type-check the Python package (the generated stub and __init__.py) with mypy
+    cmds:
+      - .venv/bin/python -m mypy --strict python/chafernet
+
+  msrv:
+    desc: Check that the workspace builds with the minimum supported Rust version
+    env:
+      # Overrides rust-toolchain.toml for every command here. `cargo +` overrides it for cargo, but newer rustups
+      # (1.29) would otherwise install the toolchain the file pins when `rustup toolchain list` runs.
+      RUSTUP_TOOLCHAIN: '{{.MSRV}}'
+    cmds:
+      - rustup toolchain list | grep -q '^{{.MSRV}}' || rustup toolchain install {{.MSRV}} --profile minimal
+      - cargo +{{.MSRV}} check --workspace --all-targets
+
+  fmt:
+    desc: Format the Rust, Python, and Markdown files, with the same tools and versions as the prek hooks
+    cmds:
+      - cargo fmt --all
+      - cmd: .venv/bin/prek run ruff-format --all-files
+        ignore_error: true
+      - cmd: .venv/bin/prek run ruff-check --all-files
+        ignore_error: true
+      - cmd: .venv/bin/prek run rumdl-fmt --all-files
+        ignore_error: true
+
+  readme:
+    desc: >-
+      Regenerate README.md, chafernet/README.md, python/README.md, and the crate docs (chafernet/src/crate-docs.md) from
+      the templates in gendocs/
+    cmds:
+      - tools/gen_readmes.py
