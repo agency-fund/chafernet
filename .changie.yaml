@@ -1,0 +1,42 @@
+# changie (https://changie.dev) configuration. Each change adds a fragment under .changes/unreleased/ (`task
+# changelog:new`); a release batches them into .changes/<version>.md, and CHANGELOG.md is generated from those. See
+# CONTRIBUTING.md.
+changesDir: .changes
+unreleasedDir: unreleased
+headerPath: header.tpl.md
+changelogPath: CHANGELOG.md
+versionExt: md
+versionFormat: '## [{{.Version}}] - {{.Time.Format "2006-01-02"}}'
+kindFormat: '### {{.Kind}}'
+# A body may span several lines; continuation lines are indented by 2 so that they hang under `- `.
+changeFormat: '- {{.Body | trim | splitList "\n" | join "\n  "}}'
+# A link reference definition, so that `## [X.Y.Z]` links to the comparison with the previous release (for the first,
+# whose PreviousVersion changie sets to v0.0.0, to its tag) without a hand-maintained footer.
+footerFormat: >-
+  {{if and .PreviousVersion (ne .PreviousVersion "v0.0.0")}}[{{.Version}}]: https://github.com/agency-fund/chafernet/compare/v{{.PreviousVersion}}...v{{.Version}}{{else}}[{{.Version}}]: https://github.com/agency-fund/chafernet/releases/tag/v{{.Version}}{{end}}
+# Kind and timestamp, so that concurrent PRs don't collide on a file name.
+fragmentFileFormat: '{{.Kind | kebabcase}}-{{.Time.Format "20060102-150405"}}'
+body:
+  block: true
+kinds:
+  - label: Breaking changes
+    auto: major
+  - label: Added
+    auto: minor
+  - label: Changed
+    auto: major
+  - label: Deprecated
+    auto: minor
+  - label: Removed
+    auto: major
+  - label: Fixed
+    auto: patch
+  - label: Security
+    auto: patch
+newlines:
+  beforeChangelogVersion: 1
+  beforeKind: 1
+  beforeChange: 1
+  beforeFooterTemplate: 1
+  endOfVersion: 1
+envPrefix: CHANGIE_

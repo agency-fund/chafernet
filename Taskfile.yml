@@ -157,6 +157,49 @@ tasks:
       - rustup toolchain list | grep -q '^{{.MSRV}}' || rustup toolchain install {{.MSRV}} --profile minimal
       - cargo +{{.MSRV}} check --workspace --all-targets
 
+  changelog:new:
+    desc: >-
+      Add a changelog fragment under .changes/unreleased/ (needs changie); prompts for the kind and body, or pass them
+      after --, e.g. task changelog:new -- -k Fixed -b "One-line body."
+    preconditions: &changie
+      - sh: command -v changie
+        msg: changie is not installed (https://changie.dev)
+    cmds:
+      - changie new {{.CLI_ARGS}}
+
+  changelog:merge:
+    desc: Regenerate CHANGELOG.md from .changes/ (needs changie)
+    preconditions: *changie
+    cmds:
+      - changie merge
+
+  changelog:check:
+    desc: Check that CHANGELOG.md matches what `task changelog:merge` generates (needs changie)
+    preconditions: *changie
+    cmds:
+      - |
+        changie merge --dry-run | diff -u CHANGELOG.md - || {
+          echo 'CHANGELOG.md is out of sync with .changes/: add a fragment with `task changelog:new` rather than editing it, and run `task changelog:merge` after editing .changes/.' >&2
+          exit 1
+        }
+
+  changelog:batch:
+    desc: >-
+      At release time, roll the fragments in .changes/unreleased/ into .changes/VERSION.md and regenerate CHANGELOG.md
+      (needs changie): give the new version, e.g. task changelog:batch -- 0.2.0, or patch, minor, or major to increment
+      the last one; edit the new file if needed, then run task changelog:merge
+    preconditions: *changie
+    cmds:
+      # With no version to increment, changie names the first one with a "v", unlike the versions given as numbers.
+      - cmd: |
+          if ! ls .changes/[0-9]*.md >/dev/null 2>&1 && ! printf '%s' '{{.CLI_ARGS}}' | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo 'The first release has no version to increment: give its number, e.g. task changelog:batch -- 0.1.0' >&2
+            exit 1
+          fi
+        silent: true
+      - changie batch {{.CLI_ARGS}}
+      - changie merge
+
   fmt:
     desc: Format the Rust, Python, and Markdown files, with the same tools and versions as the prek hooks
     cmds:
