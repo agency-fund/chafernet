@@ -1,0 +1,190 @@
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  changes:
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 5
+    outputs:
+      full: ${{ github.event_name != 'push' || startsWith(github.ref, 'refs/tags/') }}
+      code: ${{ steps.code.outputs.code }}
+      packaging: ${{ steps.packaging.outputs.packaging }}
+      tagged: ${{ steps.release.outputs.tagged }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      # A release pushes its commit and its v* tag together, which starts a run for each. The tag's run checks
+      # everything, so the branch's run of the same commit does nothing: the filters below are skipped, which leaves
+      # their outputs empty.
+      - name: Leave a release commit to its tag's run
+        id: release
+        if: github.event_name == 'push' && github.ref_type == 'branch'
+        run: |
+          if [ -n "$(git tag --points-at HEAD --list 'v*')" ]; then
+            echo "tagged=true" >> "${GITHUB_OUTPUT}"
+          fi
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: code
+        if: github.event_name == 'push' && github.ref_type == 'branch' && steps.release.outputs.tagged != 'true'
+        with:
+          predicate-quantifier: every
+          filters: |
+            code:
+              - "**"
+              - "!.changes/**"
+              - "!gendocs/**"
+              - "!CHANGELOG.md"
+              - "!CONTRIBUTING.md"
+              - "!README.md"
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: packaging
+        if: github.event_name == 'push' && github.ref_type == 'branch' && steps.release.outputs.tagged != 'true'
+        with:
+          filters: |
+            packaging:
+              - .github/workflows/ci.yml
+              - pyproject.toml
+              - Cargo.toml
+              - chafernet/Cargo.toml
+              - python/Cargo.toml
+              - Cargo.lock
+              - rust-toolchain.toml
+              - Taskfile.yml
+
+  lint:
+    needs: changes
+    if: needs.changes.outputs.tagged != 'true'
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: $/.github/actions/setup
+      - run: task setup lint
+        env:
+          ZIZMOR_GITHUB_TOKEN: ${{ github.token }}
+
+  msrv:
+    needs: changes
+    if: needs.changes.outputs.full == 'true' || needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: $/.github/actions/setup
+        with:
+          rust: false
+          uv: false
+      - run: task msrv
+
+  # The Rust crate on WebAssembly: built for browsers (wasm32-unknown-unknown, where randomness needs the wasm_js
+  # feature), and its tests run on WASI (wasm32-wasip2) under wasmtime.
+  wasm:
+    needs: changes
+    if: needs.changes.outputs.full == 'true' || needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: $/.github/actions/setup
+        with:
+          uv: false
+      - run: rustup target add wasm32-unknown-unknown wasm32-wasip2
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        with:
+          tool: wasmtime@50.0.1
+      - run: task test:wasm
+
+  # Checks that CHANGELOG.md is what changie generates from .changes/, so that changes go in fragments rather than
+  # direct edits (see CONTRIBUTING.md).
+  changelog:
+    needs: changes
+    if: needs.changes.outputs.tagged != 'true'
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install changie
+        env:
+          CHANGIE_VERSION: 1.26.0
+          # The SHA-256 of changie_${CHANGIE_VERSION}_linux_arm64.tar.gz, from the release's checksums.txt. Bump the two
+          # together.
+          CHANGIE_SHA256: ec1e542014b5134f1cf86b3a12e86d566ab5ec9bd3901bf66f42a09cd9865b6e
+        run: |
+          curl -fsSL -o "${RUNNER_TEMP}/changie.tar.gz" \
+            "https://github.com/miniscruff/changie/releases/download/v${CHANGIE_VERSION}/changie_${CHANGIE_VERSION}_linux_arm64.tar.gz"
+          echo "${CHANGIE_SHA256}  ${RUNNER_TEMP}/changie.tar.gz" | sha256sum -c -
+          mkdir -p "${RUNNER_TEMP}/bin"
+          tar -xzf "${RUNNER_TEMP}/changie.tar.gz" -C "${RUNNER_TEMP}/bin" changie
+          echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
+      - uses: $/.github/actions/setup
+        with:
+          rust: false
+          uv: false
+      - run: task changelog:check
+
+  test:
+    needs: changes
+    if: needs.changes.outputs.full == 'true' || needs.changes.outputs.code == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(needs.changes.outputs.full == 'true' && '["ubuntu-26.04", "ubuntu-26.04-arm"]' || '["ubuntu-26.04-arm"]') }}
+        python: ["3.14", "3.14t", "3.15", "3.15t"]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: $/.github/actions/setup
+      - if: matrix.python == '3.14'
+        run: task test:rust
+      - run: task setup build
+        env:
+          PYTHON: ${{ matrix.python }}
+      - run: task test:python -- -v
+        env:
+          HYPOTHESIS_PROFILE: ci
+
+  coverage:
+    needs: changes
+    if: needs.changes.outputs.full == 'true'
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: $/.github/actions/setup
+      - run: rustup component add llvm-tools-preview
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        with:
+          tool: cargo-llvm-cov
+      - run: task setup coverage
+        env:
+          PYTHON: "3.15"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage
+          path: coverage/
