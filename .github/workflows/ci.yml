@@ -188,3 +188,123 @@ jobs:
         with:
           name: coverage
           path: coverage/
+
+  wheels:
+    needs: changes
+    if: needs.changes.outputs.full == 'true' || needs.changes.outputs.packaging == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux, target: x86_64, runner: ubuntu-26.04, manylinux: "2_28" }
+          - { platform: linux, target: aarch64, runner: ubuntu-26.04-arm, manylinux: "2_28" }
+          - { platform: musllinux, target: x86_64, runner: ubuntu-26.04, manylinux: musllinux_1_2 }
+          - { platform: musllinux, target: aarch64, runner: ubuntu-26.04-arm, manylinux: musllinux_1_2 }
+          - { platform: macos, target: x86_64, runner: macos-26-intel }
+          - { platform: macos, target: aarch64, runner: macos-26 }
+          - { platform: windows, target: x64, runner: windows-2025 }
+          - { platform: windows, target: aarch64, runner: windows-11-arm }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    # For the attest step: a signing certificate, and storing the attestation and its record.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: $/.github/actions/setup
+        with:
+          rust: false
+          task: ${{ matrix.platform != 'windows' }}
+      - if: matrix.platform == 'macos'
+        run: |
+          uv python install 3.14 3.14t 3.15 3.15t
+          uv python dir --bin >> "$GITHUB_PATH"
+      # Windows has no python3.14-style names on PATH, so maturin is given each interpreter's path.
+      - name: Find the Pythons
+        id: pythons
+        if: matrix.platform == 'windows'
+        shell: bash
+        run: |
+          uv python install 3.14 3.14t 3.15 3.15t
+          args=""
+          for python in 3.14 3.14t 3.15 3.15t; do
+            args+=" -i $(uv python find --managed-python --no-project "${python}")"
+          done
+          echo "args=${args}" >> "$GITHUB_OUTPUT"
+      - name: Build wheels
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist ${{ steps.pythons.outputs.args || '-i python3.14 -i python3.14t -i python3.15 -i python3.15t' }}
+          manylinux: ${{ matrix.manylinux }}
+      - name: Test each wheel
+        if: matrix.platform == 'linux' || matrix.platform == 'macos'
+        env:
+          HYPOTHESIS_PROFILE: ci
+        run: task release:test PYTHONS="3.14 3.14t 3.15 3.15t"
+      # The runner's glibc can't load a musllinux wheel, so the tests run in an Alpine container.
+      - name: Test each wheel on Alpine
+        if: matrix.platform == 'musllinux'
+        env:
+          HYPOTHESIS_PROFILE: ci
+        run: task release:test:musl
+      # Not `task release:test`: its venv has no bin/python on Windows.
+      - name: Test each wheel on Windows
+        if: matrix.platform == 'windows'
+        shell: bash
+        env:
+          HYPOTHESIS_PROFILE: ci
+        run: |
+          for python in 3.14 3.14t 3.15 3.15t; do
+            venv="${RUNNER_TEMP}/venv-${python}"
+            uv venv --quiet --python "${python}" "${venv}"
+            uv pip install --quiet --python "${venv}" --no-index --find-links dist chafernet
+            uv pip install --quiet --python "${venv}" pytest hypothesis
+            uv run --no-project --python "${venv}" python -m pytest -q -p no:cacheprovider
+          done
+      # Signs a statement that this run built these files from this tag; publish.yml refuses files without one.
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
+        with:
+          subject-path: dist/*
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wheels-${{ matrix.platform }}-${{ matrix.target }}
+          path: dist
+
+  sdist:
+    needs: changes
+    if: needs.changes.outputs.full == 'true' || needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 10
+    # For the attest step: a signing certificate, and storing the attestation and its record.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # maturin sdist and uv's build of the project's metadata run cargo metadata.
+      - uses: $/.github/actions/setup
+      - run: task setup sdist
+      - name: Install from the sdist and test
+        env:
+          HYPOTHESIS_PROFILE: ci
+        run: task release:test PYTHONS=3.15
+      # Signs a statement that this run built these files from this tag; publish.yml refuses files without one.
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
+        with:
+          subject-path: dist/*
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wheels-sdist
+          path: dist

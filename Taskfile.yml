@@ -217,3 +217,53 @@ tasks:
       the templates in gendocs/
     cmds:
       - tools/gen_readmes.py
+
+  sdist:
+    desc: Build the source distribution into dist/
+    cmds:
+      - .venv/bin/maturin sdist --out dist
+
+  release:test:
+    desc: >-
+      Install chafernet from dist/ into a fresh venv for each Python in PYTHONS (default, the Python in .venv) and run
+      the tests on it: from the wheel that fits, or from the sdist when dist/ holds no wheels
+    vars:
+      PYTHONS: '{{.PYTHONS | default .VENV_PYTHON}}'
+    cmds:
+      - for: { var: PYTHONS, split: " " }
+        cmd: |
+          # In TMPDIR, or /tmp without one, and removed afterwards.
+          venv="$(mktemp -d)"
+          trap 'rm -rf "${venv}"' EXIT
+          uv venv --quiet --python {{.ITEM}} --clear "${venv}"
+          # --no-cache: uv otherwise serves a cached build with the same file name, from an earlier build of this
+          # version. --no-index: a wheel comes from dist/ and nowhere else. An sdist needs its build tools from PyPI.
+          if ls dist/*.whl >/dev/null 2>&1; then
+            uv pip install --quiet --no-cache --python "${venv}" --no-index --find-links dist chafernet
+          else
+            uv pip install --quiet --no-cache --python "${venv}" dist/*.tar.gz
+          fi
+          uv pip install --quiet --python "${venv}" pytest hypothesis
+          "${venv}/bin/python" -m pytest -q -p no:cacheprovider
+
+  release:test:musl:
+    desc: >-
+      Run the tests on the musllinux wheel in dist/ inside Alpine Linux (needs Docker), for each Python in PYTHONS
+      (default, every Python the wheels are built for)
+    vars:
+      PYTHONS: '{{.PYTHONS | default "3.14 3.14t 3.15 3.15t"}}'
+      # uv's Alpine image, by digest, so that the test environment changes only when this line does. uv installs a
+      # musl build of each Python in it.
+      IMAGE: ghcr.io/astral-sh/uv:0.13.5-alpine@sha256:6ba9c830aa848d21e1e9d8028ae01ed02b08980b25aeabef9a6683c5743c6d0f
+    cmds:
+      - |
+        docker run --rm -e HYPOTHESIS_PROFILE \
+          -v "$PWD/dist:/w/dist:ro" -v "$PWD/tests:/w/tests:ro" -v "$PWD/pyproject.toml:/w/pyproject.toml:ro" \
+          -w /w {{.IMAGE}} sh -euc '
+            for python in {{.PYTHONS}}; do
+              venv="/tmp/venv-${python}"
+              uv venv --quiet --python "${python}" "${venv}"
+              uv pip install --quiet --python "${venv}" --no-index --find-links dist chafernet
+              uv pip install --quiet --python "${venv}" pytest hypothesis
+              "${venv}/bin/python" -m pytest -q -p no:cacheprovider
+            done'
