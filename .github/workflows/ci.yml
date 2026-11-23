@@ -308,3 +308,49 @@ jobs:
         with:
           name: wheels-sdist
           path: dist
+
+  # On a v* tag, once everything has passed, checks the tag against the version and the registries, and puts the
+  # wheels, the sdist, and their SHA256SUMS in a draft GitHub release. Publishing that release on GitHub runs
+  # publish.yml, which uploads exactly these files to PyPI and publishes the crate. A re-run replaces the draft; a
+  # published release is never touched. Only the tag's push does this, not a manual run on the tag, so that two runs
+  # never replace the draft at once.
+  draft-release:
+    if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
+    needs: [lint, msrv, changelog, test, wasm, wheels, sdist]
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 10
+    # contents to create the release; the rest for the attest step.
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: $/.github/actions/setup
+        with:
+          rust: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+      # Stops the release if PyPI or crates.io already has this version: publish.yml would then upload only to the
+      # other registry, and the two would hold different code under the same version number.
+      - run: task release:preflight
+        env:
+          TAG: ${{ github.ref_name }}
+      - run: uvx --from "twine>=6,<7" twine check --strict dist/*
+      - run: task release:draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+      # The build jobs attest each file as soon as it is built. This attests the list of them, and only here, after
+      # every check has passed: publish.yml refuses a release whose SHA256SUMS lacks it, so files from a run that
+      # failed, or a draft with files removed, can't be published.
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: SHA256SUMS

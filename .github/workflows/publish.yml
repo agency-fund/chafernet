@@ -1,0 +1,126 @@
+# The second stage of a release. ci.yml, on a v* tag, puts the checked wheels and sdist in a draft GitHub release;
+# publishing that release on GitHub runs this workflow, which checks that ci.yml built those files from the tag,
+# uploads exactly them to PyPI, and then publishes the crate from the tag. Each step skips what the registry already
+# has, so a run that fails partway can be re-run.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  # Requires a "pypi" environment and a trusted publisher on PyPI that names this workflow:
+  # https://docs.pypi.org/trusted-publishers/
+  pypi:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+      attestations: read
+    steps:
+      # A draft release can be edited by hand, so nothing in it is trusted until it is checked against what ci.yml
+      # attested in the run of this tag and of this commit, which editing the draft can't forge:
+      # * SHA256SUMS, which ci.yml attests only once every check has passed;
+      # * that the release holds exactly the files SHA256SUMS lists, with those checksums;
+      # * each file, which the job that built it attested.
+      # A tag moved since the draft was made fails here too, so the files are built from the code the crate is.
+      - name: Download the release's files and check that ci.yml made them
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          attested() {
+            gh attestation verify "$1" --repo "${GH_REPO}" \
+              --signer-workflow "${GH_REPO}/.github/workflows/ci.yml" --source-ref "refs/tags/${TAG}" \
+              --source-digest "${GITHUB_SHA}" --deny-self-hosted-runners
+          }
+          release="${RUNNER_TEMP}/release"
+          gh release download "${TAG}" --dir "${release}"
+          cd "${release}"
+          attested SHA256SUMS
+          sha256sum --check --strict SHA256SUMS
+          diff <(find . -type f ! -name SHA256SUMS -printf '%P\n' | sort) <(awk '{ print $2 }' SHA256SUMS | sort)
+          mkdir -p "${GITHUB_WORKSPACE}/dist"
+          for file in $(awk '{ print $2 }' SHA256SUMS); do
+            attested "${file}"
+            mv -- "${file}" "${GITHUB_WORKSPACE}/dist/"
+          done
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          skip-existing: true
+
+  # Requires a "crates-io" environment and a trusted publisher on crates.io that names this workflow:
+  # https://crates.io/docs/trusted-publishing. crates.io only lets a trusted publisher be configured for a crate that
+  # exists, so the crate's first version is published with a bootstrap token instead: an API token scoped to
+  # publish-new for chafernet, short-lived, stored as the environment's CRATES_IO_BOOTSTRAP_TOKEN secret. Once the
+  # crate exists, add the trusted publisher, require trusted publishing in the crate's settings, and delete the token
+  # and the secret. This job runs after the pypi job, which fails unless the release has the files and the SHA256SUMS
+  # that ci.yml puts in it.
+  crates-io:
+    needs: pypi
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 10
+    environment: crates-io
+    # For the attest step as well as trusted publishing: a signing certificate, and storing the attestation.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Sets how to publish: nothing when crates.io has this version, "bootstrap" when it has no chafernet crate, and
+      # "trusted" otherwise.
+      - name: Ask crates.io what it has
+        id: crate
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          version="${TAG#v}"
+          status() { curl -sS -o /dev/null -w '%{http_code}' -A "chafernet-ci (https://github.com/agency-fund/chafernet)" "$1"; }
+          case "$(status "https://crates.io/api/v1/crates/chafernet/${version}")" in
+            200) echo "::notice::chafernet ${version} is already on crates.io"; exit 0 ;;
+            404) ;;
+            *) echo "::error::Could not ask crates.io whether it has chafernet ${version}"; exit 1 ;;
+          esac
+          case "$(status "https://crates.io/api/v1/crates/chafernet")" in
+            200) echo "publish=trusted" >> "${GITHUB_OUTPUT}" ;;
+            404) echo "publish=bootstrap" >> "${GITHUB_OUTPUT}" ;;
+            *) echo "::error::Could not ask crates.io whether it has the chafernet crate"; exit 1 ;;
+          esac
+      - if: steps.crate.outputs.publish != ''
+        uses: $/.github/actions/setup
+        with:
+          uv: false
+      # cargo package builds the crate file and checks that it compiles, without uploading. That file is attested, so
+      # that there is a signed statement that this run built it from this tag (`gh attestation verify
+      # chafernet-X.Y.Z.crate --repo ...`). The task then uploads without compiling again. cargo publish always
+      # packages anew, so the task also checks that crates.io received the attested bytes.
+      - if: steps.crate.outputs.publish != ''
+        run: cargo package --locked -p chafernet
+      - if: steps.crate.outputs.publish != ''
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: target/package/chafernet-*.crate
+      - if: steps.crate.outputs.publish == 'trusted'
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+        id: auth
+      - if: steps.crate.outputs.publish != ''
+        run: |
+          if [ -z "${CARGO_REGISTRY_TOKEN}" ]; then
+            echo "::error::No token: the first version needs the crates-io environment's CRATES_IO_BOOTSTRAP_TOKEN secret"
+            exit 1
+          fi
+          task ci:publish:crate
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crate.outputs.publish == 'bootstrap' && secrets.CRATES_IO_BOOTSTRAP_TOKEN || steps.auth.outputs.token }}

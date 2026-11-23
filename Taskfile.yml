@@ -1,5 +1,6 @@
 # $schema: https://taskfile.dev/schema.json
 # The development commands, run with Task (https://taskfile.dev): `task --list` shows them. CI runs these same tasks.
+# Tasks named ci:* are meant to run only in CI, where the credentials they need exist.
 version: "3"
 
 vars:
@@ -267,3 +268,127 @@ tasks:
               uv pip install --quiet --python "${venv}" pytest hypothesis
               "${venv}/bin/python" -m pytest -q -p no:cacheprovider
             done'
+
+  release:tag:
+    desc: >-
+      After `task changelog:batch -- X.Y.Z`: set that version in Cargo.toml and Cargo.lock, run `task lint test`,
+      commit the version with the changelog as "Release X.Y.Z", and tag the commit vX.Y.Z (needs changie); pushes
+      nothing
+    preconditions: *changie
+    silent: true
+    cmds:
+      - |
+        set -eu
+        version="$(changie latest --remove-prefix)"
+        if [ ! -f ".changes/${version}.md" ] || git rev-parse -q --verify "refs/tags/v${version}" >/dev/null; then
+          echo "Nothing to release: run \`task changelog:batch -- X.Y.Z\` first (the latest version in .changes/ is ${version})" >&2
+          exit 1
+        fi
+        # Only the changelog may have uncommitted changes, so that the release commit holds nothing else.
+        other="$(git status --porcelain --untracked-files=no | grep -Ev '^.. (\.changes/|CHANGELOG\.md$)' || true)"
+        if [ -n "${other}" ]; then
+          printf 'Commit or stash these first:\n%s\n' "${other}" >&2
+          exit 1
+        fi
+        changie merge --dry-run | diff -q CHANGELOG.md - >/dev/null || {
+          echo 'CHANGELOG.md is out of sync with .changes/: run `task changelog:merge`' >&2
+          exit 1
+        }
+        # The file becomes the notes of the GitHub release, and changie writes each entry as a list item.
+        if ! grep -q '^- ' ".changes/${version}.md"; then
+          echo ".changes/${version}.md has no entries, so the release would have no notes: write them in it and run \`task changelog:merge\`" >&2
+          exit 1
+        fi
+        # A branch that is behind its remote can't be pushed, and by then the tag would exist.
+        if git rev-parse -q --verify '@{upstream}' >/dev/null; then
+          git fetch --quiet
+          if [ -n "$(git rev-list -n 1 'HEAD..@{upstream}')" ]; then
+            echo "$(git branch --show-current) is behind its remote: pull first" >&2
+            exit 1
+          fi
+        fi
+        # From here until the commit, a failure puts the version back, so that the task can be run again.
+        trap 'git checkout --quiet -- Cargo.toml Cargo.lock' EXIT
+        # The one version in Cargo.toml: `version` under [workspace.package], which both crates inherit.
+        # Not sed -i: GNU's and macOS's take different arguments.
+        sed -E "s/^(version = )\"[^\"]*\"/\1\"${version}\"/" Cargo.toml > Cargo.toml.new && mv Cargo.toml.new Cargo.toml
+        grep -qx "version = \"${version}\"" Cargo.toml
+        # Not an update of the dependencies: --workspace rewrites only the workspace's own packages in the lock
+        # file, which records their version, and CI builds with --locked.
+        cargo update --quiet --workspace
+        # What CI will check on the tag, checked here first, on the tree that is about to be tagged.
+        task lint test
+        git add -- .changes CHANGELOG.md Cargo.toml Cargo.lock
+        git commit --quiet -m "Release ${version}"
+        trap - EXIT
+        git tag -a "v${version}" -m "chafernet ${version}"
+        echo "Committed and tagged v${version}. Review it with \`git show\`, then push the commit and the tag together:"
+        echo "  git push --atomic origin $(git branch --show-current) v${version}"
+
+  release:preflight:
+    desc: Check that TAG (e.g. v1.2.0) names the version in Cargo.toml and that neither PyPI nor crates.io has it yet
+    silent: true
+    requires:
+      vars: [TAG]
+    env:
+      TAG: '{{.TAG}}'
+    cmds:
+      - |
+        version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+        if [ "${TAG}" != "v${version}" ]; then
+          echo "::error::The tag ${TAG} does not match the version ${version} in Cargo.toml"
+          exit 1
+        fi
+        status() { curl -sS -o /dev/null -w '%{http_code}' -A "chafernet-ci (https://github.com/agency-fund/chafernet)" "$1"; }
+        case "$(status "https://pypi.org/pypi/chafernet/${version}/json")" in
+          404) ;;
+          200) echo "::error::chafernet ${version} is already on PyPI"; exit 1 ;;
+          *) echo "::error::Could not ask PyPI whether it has chafernet ${version}"; exit 1 ;;
+        esac
+        case "$(status "https://crates.io/api/v1/crates/chafernet/${version}")" in
+          404) ;;
+          200) echo "::error::chafernet ${version} is already on crates.io"; exit 1 ;;
+          *) echo "::error::Could not ask crates.io whether it has chafernet ${version}"; exit 1 ;;
+        esac
+        echo "chafernet ${version} is on neither PyPI nor crates.io"
+
+  release:draft:
+    desc: >-
+      Put the files in dist/ and their SHA256SUMS in a draft GitHub release for TAG, replacing an earlier draft, with
+      .changes/VERSION.md as the notes (needs gh); CI runs it on a v* tag
+    silent: true
+    requires:
+      vars: [TAG]
+    env:
+      TAG: '{{.TAG}}'
+    cmds:
+      - |
+        (cd dist && sha256sum -- * > ../SHA256SUMS)
+        case "$(gh release view "${TAG}" --json isDraft --jq .isDraft 2>/dev/null)" in
+          true) gh release delete "${TAG}" --yes ;;
+          false) echo "::error::The release ${TAG} is already published"; exit 1 ;;
+        esac
+        notes=".changes/${TAG#v}.md"
+        if [ -f "${notes}" ]; then
+          gh release create "${TAG}" --draft --verify-tag --title "${TAG}" --notes-file "${notes}" dist/* SHA256SUMS
+        else
+          gh release create "${TAG}" --draft --verify-tag --title "${TAG}" --generate-notes dist/* SHA256SUMS
+        fi
+
+  ci:publish:crate:
+    desc: >-
+      Publish the crate without compiling it again, and check that crates.io received the file that `cargo package`
+      built before and CI attested; CI runs it when a release is published (CARGO_REGISTRY_TOKEN must be set)
+    cmds:
+      - |
+        crate="$(ls target/package/chafernet-*.crate)"
+        version="${crate##*/chafernet-}"
+        version="${version%.crate}"
+        attested="$(sha256sum < "${crate}" | cut -d' ' -f1)"
+        cargo publish --no-verify --locked -p chafernet
+        # cargo publish packages again rather than uploading that file, so compare what the registry recorded.
+        published="$(curl -fsS -A "chafernet-ci (https://github.com/agency-fund/chafernet)" "https://crates.io/api/v1/crates/chafernet/${version}" | python3 -c 'import json, sys; print(json.load(sys.stdin)["version"]["checksum"])')"
+        if [ "${published}" != "${attested}" ]; then
+          echo "::error::crates.io has a different chafernet ${version} than the file that was attested"
+          exit 1
+        fi
