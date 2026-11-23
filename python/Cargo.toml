@@ -1,0 +1,17 @@
+[package]
+name = "chafernet-py"
+description = "Chafernet tokens for Python"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+chafernet.workspace = true
+pyo3 = { version = "0.30", features = ["experimental-inspect"] }
+zeroize = "1"

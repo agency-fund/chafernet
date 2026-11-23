@@ -1,6 +1,9 @@
 [workspace]
-members = ["chafernet"]
+members = ["chafernet", "python"]
 resolver = "3"
+
+[workspace.dependencies]
+chafernet = { path = "chafernet" }
 
 [workspace.package]
 version = "0.0.1"
