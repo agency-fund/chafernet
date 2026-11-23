@@ -1,3 +1,0 @@
-kind: Added
-body: 'Initial release: the `chafernet` Rust crate, which encrypts and decrypts Chafernet tokens (XChaCha20-Poly1305 with an encrypted timestamp, additional authenticated data, and key rotation), and the `chafernet` Python package built on it, with wheels for CPython 3.14 and 3.15, including the free-threaded builds, on Linux (glibc and musl), macOS, and Windows. The crate also builds for WebAssembly: WASI, and browsers with the `wasm_js` feature.'
-time: 2026-11-04T13:00:00.000000000Z
