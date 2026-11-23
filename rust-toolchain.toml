@@ -1,0 +1,6 @@
+# The Rust version for development and for CI, whose jobs install it from this file (`rustup toolchain install`).
+# Use the full major.minor.patch version.
+# maturin omits this file from the sdist.
+[toolchain]
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]
