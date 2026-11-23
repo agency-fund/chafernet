@@ -1,0 +1,33 @@
+# RustSec advisories (cargo audit) and audits of every dependency (cargo vet) for Cargo.lock. Weekly as well as on
+# changes, because advisories are published whether or not anything is pushed. See CONTRIBUTING.md.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: supply-chain-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  supply-chain:
+    name: cargo audit + cargo vet
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install --no-self-update
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        with:
+          # cargo-vet 0.10.3 or later reads the trusted-publisher entries in supply-chain/.
+          tool: cargo-audit,cargo-vet@0.10.3
+      - run: cargo audit --deny warnings
+      - run: cargo vet --locked
