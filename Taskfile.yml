@@ -12,6 +12,11 @@ vars:
   # The Python in .venv, as uv names it (3.14, 3.15t, ...), or PYTHON if there is no .venv.
   VENV_PYTHON:
     sh: test -x .venv/bin/python && .venv/bin/python -c "import sys, sysconfig; print(f'{sys.version_info[0]}.{sys.version_info[1]}' + ('t' if sysconfig.get_config_var('Py_GIL_DISABLED') else ''))" || echo {{.PYTHON}}
+  # Where the state (terraform.tfstate) and the variables (terraform.tfvars) of .github/tf/gh.tf are kept, outside the
+  # repository; `task gh:init TF_DIR=../elsewhere` picks another directory. A relative path starts at the repository.
+  TF_DIR: '{{.TF_DIR | default "../tf/chafernet"}}'
+  # TF_DIR as an absolute path, because tofu runs in .github/tf.
+  TF_PATH: '{{if isAbs .TF_DIR}}{{.TF_DIR}}{{else}}{{joinPath .ROOT_DIR .TF_DIR}}{{end}}'
 
 tasks:
   default:
@@ -392,3 +397,34 @@ tasks:
           echo "::error::crates.io has a different chafernet ${version} than the file that was attested"
           exit 1
         fi
+
+  gh:init:
+    desc: Download the OpenTofu provider that .github/tf/gh.tf uses and point it at the state in TF_DIR (needs tofu)
+    cmds:
+      - tofu -chdir=.github/tf init -input=false -reconfigure -backend-config=path={{.TF_PATH}}/terraform.tfstate
+
+  gh:validate:
+    desc: Check the formatting and the validity of .github/tf/gh.tf; `task gh:init` comes first
+    cmds:
+      - tofu -chdir=.github/tf fmt -check -diff
+      - tofu -chdir=.github/tf validate
+
+  gh:plan:
+    desc: Show what `task gh:apply` would change in the GitHub repository's settings
+    interactive: true
+    cmds:
+      - tofu -chdir=.github/tf plan -var-file={{.TF_PATH}}/terraform.tfvars {{.CLI_ARGS}}
+
+  gh:apply:
+    desc: Apply .github/tf/gh.tf to the GitHub repository's settings, after showing the changes and asking
+    interactive: true
+    cmds:
+      - tofu -chdir=.github/tf apply -var-file={{.TF_PATH}}/terraform.tfvars {{.CLI_ARGS}}
+
+  gh:destroy:
+    desc: >-
+      Remove the settings of .github/tf/gh.tf from the GitHub repository, with the publishing environments and their
+      secrets; refuses until `tofu state rm github_repository.this` has let go of the repository itself
+    interactive: true
+    cmds:
+      - tofu -chdir=.github/tf destroy -var-file={{.TF_PATH}}/terraform.tfvars {{.CLI_ARGS}}

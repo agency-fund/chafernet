@@ -27,6 +27,7 @@ Thumbs.db
 .envrc
 .direnv/
 .task/
+/.github/tf/.terraform/
 CLAUDE.local.md
 .mcp.json
 .claude
